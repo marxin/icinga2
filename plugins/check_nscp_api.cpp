@@ -286,10 +286,20 @@ static Dictionary::Ptr FetchData(const String& host, const String& port, const S
 	 */
 	parser.eager(true);
 
-	http::read(*tlsStream, buf, parser, ec);
+	//http::read(*tlsStream, buf, parser, ec);
 
-	if (ec)
-		std::cerr << "Error reading body: " << ec.message();
+	//if (ec)
+	//	std::cerr << "Error reading body: " << ec.message();
+
+	http::async_read(*tlsStream, buf, parser, [buf](boost::system::error_code ec, std::size_t length) {
+			if (!ec)
+				std::cout << "Got some data: " << boost::beast::buffers(buf.data());
+			else
+				std::cout << "Got error " << ec << " with data: " << boost::beast::buffers(buf.data());
+		});
+
+
+	//TODO: Write a custom parser which avoids throwing an error when 'bad_status' happens.
 
 	auto& response (parser.get());
 
