@@ -1,106 +1,41 @@
 /* Icinga 2 | (c) 2012 Icinga GmbH | GPLv2+ */
 
-#define VERSION "1.0.1"
+#include "icinga-version.h" /* include VERSION */
 
-#include "remote/httpclientconnection.hpp"
-#include "remote/httprequest.hpp"
-#include "remote/url-characters.hpp"
 #include "base/application.hpp"
 #include "base/json.hpp"
 #include "base/string.hpp"
 #include "base/logger.hpp"
 #include "base/exception.hpp"
+#include "base/utility.hpp"
+#include "base/convert.hpp"
+#include "base/networkstream.hpp"
+#include "base/defer.hpp"
+#include "base/io-engine.hpp"
+#include "base/stream.hpp"
+#include "base/tcpsocket.hpp" /* include global icinga::Connect */
+#include "base/tlsstream.hpp"
+#include "base/base64.hpp"
+#include "remote/url.hpp"
+#include <remote/url-characters.hpp>
 #include <boost/program_options.hpp>
 #include <boost/algorithm/string/split.hpp>
+#include <boost/asio/ssl/context.hpp>
+#include <boost/beast/core/flat_buffer.hpp>
+#include <boost/beast/http/field.hpp>
+#include <boost/beast/http/message.hpp>
+#include <boost/beast/http/parser.hpp>
+#include <boost/beast/http/read.hpp>
+#include <boost/beast/http/status.hpp>
+#include <boost/beast/http/string_body.hpp>
+#include <boost/beast/http/verb.hpp>
+#include <boost/beast/http/write.hpp>
 #include <iostream>
 
 using namespace icinga;
 namespace po = boost::program_options;
 
 static bool l_Debug;
-
-/*
- * This function is called by an 'HttpRequest' once the server answers. After doing a short check on the 'response' it
- * decodes it to a Dictionary and then tells 'QueryEndpoint()' that it's done
- */
-static void ResultHttpCompletionCallback(const HttpRequest& request, HttpResponse& response, bool& ready,
-	boost::condition_variable& cv, boost::mutex& mtx, Dictionary::Ptr& result)
-{
-	String body;
-	char buffer[1024];
-	size_t count;
-
-	while ((count = response.ReadBody(buffer, sizeof(buffer))) > 0)
-		body += String(buffer, buffer + count);
-
-	if (l_Debug) {
-		std::cout << "Received answer\n"
-			<< "\tHTTP code: " << response.StatusCode << "\n"
-			<< "\tHTTP message: '" << response.StatusMessage << "'\n"
-			<< "\tHTTP body: '" << body << "'.\n";
-	}
-
-	// Only try to decode the body if the 'HttpRequest' was successful
-	if (response.StatusCode != 200)
-		result = Dictionary::Ptr();
-	else
-		result = JsonDecode(body);
-
-	// Unlock our mutex, set ready and notify 'QueryEndpoint()'
-	boost::mutex::scoped_lock lock(mtx);
-	ready = true;
-	cv.notify_all();
-}
-
-/*
- * This function takes all the information required to query an nscp instance on
- * 'host':'port' with 'password'. The String 'endpoint' contains the specific
- * query name and all the arguments formatted as an URL.
- */
-static Dictionary::Ptr QueryEndpoint(const String& host, const String& port, const String& password,
-	const String& endpoint)
-{
-	HttpClientConnection::Ptr m_Connection = new HttpClientConnection(host, port, true);
-
-	try {
-		bool ready = false;
-		boost::condition_variable cv;
-		boost::mutex mtx;
-		Dictionary::Ptr result;
-		std::shared_ptr<HttpRequest> req = m_Connection->NewRequest();
-		req->RequestMethod = "GET";
-
-		// Url() will call Utillity::UnescapeString() which will thrown an exception if it finds a lonely %
-		req->RequestUrl = new Url(endpoint);
-
-		// NSClient++ uses `time=1m&time=5m` instead of `time[]=1m&time[]=5m`
-		req->RequestUrl->SetArrayFormatUseBrackets(false);
-
-		req->AddHeader("password", password);
-		if (l_Debug) {
-			std::cout << "Sending request to 'https://" << host << ":" << port << req->RequestUrl->Format(false, false) << "'\n"
-				<< "Headers: " << JsonEncode(req->Headers) << "\n";
-		}
-
-		// Submits the request. The 'ResultHttpCompletionCallback' is called once the HttpRequest receives an answer,
-		// which then sets 'ready' to true
-		m_Connection->SubmitRequest(req, std::bind(ResultHttpCompletionCallback, _1, _2,
-			boost::ref(ready), boost::ref(cv), boost::ref(mtx), boost::ref(result)));
-
-		// We need to spinlock here because our 'HttpRequest' works asynchronous
-		boost::mutex::scoped_lock lock(mtx);
-		while (!ready) {
-			cv.wait(lock);
-		}
-
-		return result;
-	}
-	catch (const std::exception& ex) {
-		// Exceptions should only happen in extreme edge cases we can't recover from
-		std::cout << "Caught exception: " << DiagnosticInformation(ex, false) << '\n';
-		return Dictionary::Ptr();
-	}
-}
 
 /*
  * Takes a Dictionary 'result' and constructs an icinga compliant output string.
@@ -110,7 +45,7 @@ static Dictionary::Ptr QueryEndpoint(const String& host, const String& port, con
 static int FormatOutput(const Dictionary::Ptr& result)
 {
 	if (!result) {
-		std::cout << "UNKNOWN: No data received.\n";
+		std::cerr << "UNKNOWN: No data received.\n";
 		return 3;
 	}
 
@@ -119,17 +54,17 @@ static int FormatOutput(const Dictionary::Ptr& result)
 
 	Array::Ptr payloads = result->Get("payload");
 	if (!payloads) {
-		std::cout << "UNKNOWN: Answer format error: Answer is missing 'payload'.\n";
+		std::cerr << "UNKNOWN: Answer format error: Answer is missing 'payload'.\n";
 		return 3;
 	}
 
 	if (payloads->GetLength() == 0) {
-		std::cout << "UNKNOWN: Answer format error: 'payload' was empty.\n";
+		std::cerr << "UNKNOWN: Answer format error: 'payload' was empty.\n";
 		return 3;
 	}
 
 	if (payloads->GetLength() > 1) {
-		std::cout << "UNKNOWN: Answer format error: Multiple payloads are not supported.";
+		std::cerr << "UNKNOWN: Answer format error: Multiple payloads are not supported.";
 		return 3;
 	}
 
@@ -137,7 +72,7 @@ static int FormatOutput(const Dictionary::Ptr& result)
 	try {
 		payload = payloads->Get(0);
 	} catch (const std::exception&) {
-		std::cout << "UNKNOWN: Answer format error: 'payload' was not a Dictionary.\n";
+		std::cerr << "UNKNOWN: Answer format error: 'payload' was not a Dictionary.\n";
 		return 3;
 	}
 
@@ -145,12 +80,12 @@ static int FormatOutput(const Dictionary::Ptr& result)
 	try {
 		lines = payload->Get("lines");
 	} catch (const std::exception&) {
-		std::cout << "UNKNOWN: Answer format error: 'payload' is missing 'lines'.\n";
+		std::cerr << "UNKNOWN: Answer format error: 'payload' is missing 'lines'.\n";
 		return 3;
 	}
 
 	if (!lines) {
-		std::cout << "UNKNOWN: Answer format error: 'lines' is Null.\n";
+		std::cerr << "UNKNOWN: Answer format error: 'lines' is Null.\n";
 		return 3;
 	}
 
@@ -162,11 +97,11 @@ static int FormatOutput(const Dictionary::Ptr& result)
 		try {
 			line = vline;
 		} catch (const std::exception&) {
-			std::cout << "UNKNOWN: Answer format error: 'lines' entry was not a Dictionary.\n";
+			std::cerr << "UNKNOWN: Answer format error: 'lines' entry was not a Dictionary.\n";
 			return 3;
 		}
 		if (!line) {
-			std::cout << "UNKNOWN: Answer format error: 'lines' entry was Null.\n";
+			std::cerr << "UNKNOWN: Answer format error: 'lines' entry was Null.\n";
 			return 3;
 		}
 
@@ -209,12 +144,180 @@ static int FormatOutput(const Dictionary::Ptr& result)
 		state == "UNKNOWN" ? 3 : 4;
 
 	if (creturn == 4) {
-		std::cout << "check_nscp_api UNKNOWN Answer format error: 'result' was not a known state.\n";
+		std::cerr << "UNKNOWN Answer format error: 'result' was not a known state.\n";
 		return 3;
 	}
 
 	std::cout << ssout.rdbuf();
 	return creturn;
+}
+
+/**
+ * Connects to host:port and performs a TLS shandshake
+ *
+ * @param host To connect to.
+ * @param port To connect to.
+ *
+ * @returns AsioTlsStream pointer for future HTTP connections.
+ */
+static std::shared_ptr<AsioTlsStream> Connect(const String& host, const String& port)
+{
+	std::shared_ptr<boost::asio::ssl::context> sslContext;
+
+	try {
+		sslContext = MakeAsioSslContext(Empty, Empty, Empty); //TODO: Add support for cert, key, ca parameters
+	} catch(const std::exception& ex) {
+		Log(LogCritical, "DebugConsole")
+			<< "Cannot make SSL context: " << ex.what();
+		throw;
+	}
+
+	std::shared_ptr<AsioTlsStream> stream = std::make_shared<AsioTlsStream>(IoEngine::Get().GetIoService(), *sslContext, host);
+
+	try {
+		icinga::Connect(stream->lowest_layer(), host, port);
+	} catch (const std::exception& ex) {
+		Log(LogWarning, "DebugConsole")
+			<< "Cannot connect to REST API on host '" << host << "' port '" << port << "': " << ex.what();
+		throw;
+	}
+
+	auto& tlsStream (stream->next_layer());
+
+	try {
+		tlsStream.handshake(tlsStream.client);
+	} catch (const std::exception& ex) {
+		Log(LogWarning, "DebugConsole")
+			<< "TLS handshake with host '" << host << "' failed: " << ex.what();
+		throw;
+	}
+
+	return std::move(stream);
+}
+
+static Dictionary::Ptr FetchData(const String& host, const String& port, const String& password,
+	const String& endpoint)
+{
+	namespace beast = boost::beast;
+	namespace http = beast::http;
+
+
+	std::shared_ptr<AsioTlsStream> tlsStream;
+
+	try {
+		tlsStream = Connect(host, port);
+	} catch (const std::exception& ex) {
+		std::cerr << "Connection error: " << ex.what();
+		throw ex;
+	}
+
+	Url::Ptr url;
+
+	try {
+		url = new Url(endpoint);
+	} catch (const std::exception& ex) {
+		std::cerr << "URL error: " << ex.what();
+		throw ex;
+	}
+
+	url->SetScheme("https");
+	url->SetHost(host);
+	url->SetPort(port);
+
+	// NSClient++ uses `time=1m&time=5m` instead of `time[]=1m&time[]=5m`
+	url->SetArrayFormatUseBrackets(false);
+
+	http::request<http::string_body> request (http::verb::get, std::string(url->Format(true)), 10);
+
+	request.set(http::field::user_agent, "Icinga/check_nscp_api/" + Convert::ToString(VERSION));
+	request.set(http::field::host, host + ":" + port);
+
+	request.set(http::field::accept, "application/json");
+	request.set("password", password);
+
+	if (l_Debug) {
+		std::cout << "Sending request to " << url->Format(false, false) << "'.\n";
+	}
+
+	try {
+		http::write(*tlsStream, request);
+		tlsStream->flush();
+	} catch (const std::exception& ex) {
+		std::cerr << "Cannot write HTTP request to REST API at URL '" << url->Format(false, false) << "': " << ex.what();
+		throw ex;
+	}
+
+
+	http::parser<false, http::string_body> parser;
+	//http::response<http::string_body> response;
+	beast::flat_buffer buf;
+	boost::system::error_code ec;
+
+	/*
+	try {
+		http::read(*tlsStream, buf, parser);
+	} catch (const boost::system::system_error& ex) {
+		// Workaround for missing status/reason phrase in NSCP, https://github.com/mickem/nscp/issues/610
+		if (ex.code() != http::error::bad_reason && ex.code() != http::error::bad_status) {
+			std::cerr << "Failed to parse HTTP response from REST API at URL '" << url->Format(false, false) << "': "
+					  << ex.what();
+			throw ex;
+		} else {
+
+		}
+	}
+	 */
+
+	/*
+	http::read_header(*tlsStream, buf, parser, ec);
+
+	//This will always fail since NSClient's header is not RFC conform. https://github.com/mickem/nscp/issues/610
+	if (ec)
+		std::cerr << "Error reading header: " << ec.message();
+*/
+	/* https://www.boost.org/doc/libs/1_68_0/libs/beast/doc/html/beast/using_http/buffer_oriented_parsing.html
+	 *
+	 * Normally the parser returns after successfully parsing a structured element (header, chunk header, or chunk body)
+	 * even if there are octets remaining in the input. This is necessary when attempting to parse the header first, or
+	 * when the caller wants to inspect information which may be invalidated by subsequent parsing, such as a chunk extension.
+	 * The eager option controls whether the parser keeps going after parsing structured element if there are octets remaining
+	 * in the buffer and no error occurs. This option is automatically set or cleared during certain stream operations to improve
+	 * performance with no change in functionality.
+	 */
+	parser.eager(true);
+
+	http::read(*tlsStream, buf, parser, ec);
+
+	if (ec)
+		std::cerr << "Error reading body: " << ec.message();
+
+	auto& response (parser.get());
+
+	// Handle HTTP errors first. Unfortunately NSClient treats every request as OK. */
+	if (response.result() != http::status::ok) {
+		std::string message = "HTTP request failed; Code: " + Convert::ToString(response.result()) + "; Body: " + response.body();
+		BOOST_THROW_EXCEPTION(ScriptError(message));
+	}
+
+	auto& body (response.body());
+
+	if (l_Debug) {
+		std::cout << "Received answer\n"
+				  << "\tHTTP code: " << response.result() << "\n"
+				  << "\tHTTP body: '" << response.body() << "'.\n";
+	}
+
+	Dictionary::Ptr jsonResponse;
+
+	try {
+		jsonResponse = JsonDecode(body);
+	} catch (...) {
+		std::string message = "Cannot parse JSON response body: " + body;
+		BOOST_THROW_EXCEPTION(ScriptError(message));
+	}
+
+
+	return jsonResponse;
 }
 
 /*
@@ -293,11 +396,15 @@ int main(int argc, char **argv)
 		}
 	}
 
-	// This needs to happen for HttpRequest to work
-	Application::InitializeBase();
+	Dictionary::Ptr result;
 
-	Dictionary::Ptr result = QueryEndpoint(vm["host"].as<std::string>(), vm["port"].as<std::string>(),
-		vm["password"].as<std::string>(), endpoint);
+	try {
+		result = FetchData(vm["host"].as<std::string>(), vm["port"].as<std::string>(),
+		   vm["password"].as<std::string>(), endpoint);
+	} catch (const std::exception& ex) {
+		std::cerr << "UNKNOWN - " << ex.what();
+		exit(3);
+	}
 
 	// Application::Exit() is the clean way to exit after calling InitializeBase()
 	Application::Exit(FormatOutput(result));
