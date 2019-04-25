@@ -40,18 +40,14 @@ private:
 	mutable boost::mutex m_Mutex;
 	mutable boost::condition_variable m_CV;
 
-	static std::shared_ptr<AsioTlsStream> Connect(const String& host, const String& port);
+	static std::shared_ptr<AsioTlsStream> Connect(const Url::Ptr& url);
 
 	static Value ExecuteScript(const String& session, const std::shared_ptr<AsioTlsStream>& tlsStream,
 		const Url::Ptr& url, const String& command, bool sandboxed);
+	static Array::Ptr AutoCompleteScript(const String& session, const std::shared_ptr<AsioTlsStream>& tlsStream,
+		const Url::Ptr& url, const String& command, bool sandboxed);
 
 	static Dictionary::Ptr SendRequest(const std::shared_ptr<AsioTlsStream>& tlsStream, const Url::Ptr& url);
-
-	static void ExecuteScriptCompletionHandler(boost::mutex& mutex, boost::condition_variable& cv,
-		bool& ready, const boost::exception_ptr& eptr, const Value& result, Value& resultOut,
-		boost::exception_ptr& eptrOut);
-	static void AutocompleteScriptCompletionHandler(boost::mutex& mutex, boost::condition_variable& cv,
-		bool& ready, const boost::exception_ptr& eptr, const Array::Ptr& result, Array::Ptr& resultOut);
 
 #ifdef HAVE_EDITLINE
 	static char *ConsoleCompleteHelper(const char *word, int state);

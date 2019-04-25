@@ -42,6 +42,7 @@ using namespace icinga;
 namespace po = boost::program_options;
 
 static ScriptFrame *l_ScriptFrame;
+static Url::Ptr l_Url;
 static std::shared_ptr<AsioTlsStream> l_TlsStream;
 static String l_Session;
 
@@ -186,7 +187,7 @@ void ConsoleCommand::InitParameters(boost::program_options::options_description&
  *
  * @returns AsioTlsStream pointer for future HTTP connections.
  */
-std::shared_ptr<AsioTlsStream> ConsoleCommand::Connect(const String& host, const String& port)
+std::shared_ptr<AsioTlsStream> ConsoleCommand::Connect()
 {
 	std::shared_ptr<boost::asio::ssl::context> sslContext;
 
@@ -198,10 +199,13 @@ std::shared_ptr<AsioTlsStream> ConsoleCommand::Connect(const String& host, const
 		throw;
 	}
 
+	String host = l_Url->GetHost();
+	String port = l_Url->GetPort();
+
 	std::shared_ptr<AsioTlsStream> stream = std::make_shared<AsioTlsStream>(IoEngine::Get().GetIoService(), *sslContext, host);
 
 	try {
-		icinga::Connect(stream->lowest_layer(), host, port);
+		icinga::Connect(stream->lowest_layer(), host, port;
 	} catch (const std::exception& ex) {
 		Log(LogWarning, "DebugConsole")
 			<< "Cannot connect to REST API on host '" << host << "' port '" << port << "': " << ex.what();
@@ -226,19 +230,19 @@ std::shared_ptr<AsioTlsStream> ConsoleCommand::Connect(const String& host, const
 char *ConsoleCommand::ConsoleCompleteHelper(const char *word, int state)
 {
 	static std::vector<String> matches;
-/*
+
 	if (state == 0) {
 		if (!l_TlsStream)
 			matches = ConsoleHandler::GetAutocompletionSuggestions(word, *l_ScriptFrame);
 		else {
 			Array::Ptr suggestions;
 
-			l_ApiClient->AutocompleteScript(l_Session, word, l_ScriptFrame->Sandboxed,
-				std::bind(&ConsoleCommand::AutocompleteScriptCompletionHandler,
-				std::ref(mutex), std::ref(cv), std::ref(ready),
-				_1, _2,
-				std::ref(suggestions)));
-
+			/* Remote debug console. */
+			try {
+				suggestions = AutoCompleteScript(l_Session, l_TlsStream, l_Url, word, l_ScriptFrame->Sandboxed);
+			} catch (...) {
+				return nullptr; //Errors are just ignored here.
+			}
 
 			matches.clear();
 
@@ -251,7 +255,6 @@ char *ConsoleCommand::ConsoleCompleteHelper(const char *word, int state)
 		return nullptr;
 
 	return strdup(matches[state].CStr());
- */
 }
 #endif /* HAVE_EDITLINE */
 
@@ -286,8 +289,37 @@ int ConsoleCommand::Run(const po::variables_map& vm, const std::vector<std::stri
 	if (!addrEnv.IsEmpty())
 		addr = addrEnv;
 
-	if (vm.count("connect"))
+	/* Initialize remote connect parameters. */
+	if (vm.count("connect")) {
 		addr = vm["connect"].as<std::string>();
+
+		try {
+			l_Url = new Url(addr);
+		} catch (const std::exception& ex) {
+			Log(LogCritical, "ConsoleCommand", ex.what());
+			return EXIT_FAILURE;
+		}
+
+		String usernameEnv = Utility::GetFromEnvironment("ICINGA2_API_USERNAME");
+		String passwordEnv = Utility::GetFromEnvironment("ICINGA2_API_PASSWORD");
+
+		if (!usernameEnv.IsEmpty())
+			l_Url->SetUsername(usernameEnv);
+		if (!passwordEnv.IsEmpty())
+			l_Url->SetPassword(passwordEnv);
+
+		if (l_Url->GetPort().IsEmpty())
+			l_Url->SetPort("5665");
+
+		/* User passed --connect and wants to run the expression via REST API.
+		 * Evaluate this now before any user input happens.
+		 */
+		try {
+			l_TlsStream = ConsoleCommand::Connect(connectAddr);
+		} catch (const std::exception& ex) {
+			return EXIT_FAILURE;
+		}
+	}
 
 	String command;
 	bool syntaxOnly = false;
@@ -322,7 +354,7 @@ int ConsoleCommand::Run(const po::variables_map& vm, const std::vector<std::stri
 }
 
 int ConsoleCommand::RunScriptConsole(ScriptFrame& scriptFrame, const String& connectAddr, const String& session,
-        const String& commandOnce, const String& commandOnceFileName, bool syntaxOnly)
+		const String& commandOnce, const String& commandOnceFileName, bool syntaxOnly)
 {
 	std::map<String, String> lines;
 	int next_line = 1;
@@ -348,38 +380,6 @@ int ConsoleCommand::RunScriptConsole(ScriptFrame& scriptFrame, const String& con
 
 	l_ScriptFrame = &scriptFrame;
 	l_Session = session;
-
-	/* User passed --connect and wants to run the expression via REST API.
-	 * Evaluate this now before any user input happens.
-	 */
-	Url::Ptr url;
-	std::shared_ptr<AsioTlsStream> tlsStream;
-
-	if (!connectAddr.IsEmpty()) {
-		try {
-			url = new Url(connectAddr);
-		} catch (const std::exception& ex) {
-			Log(LogCritical, "ConsoleCommand", ex.what());
-			return EXIT_FAILURE;
-		}
-
-		String usernameEnv = Utility::GetFromEnvironment("ICINGA2_API_USERNAME");
-		String passwordEnv = Utility::GetFromEnvironment("ICINGA2_API_PASSWORD");
-
-		if (!usernameEnv.IsEmpty())
-			url->SetUsername(usernameEnv);
-		if (!passwordEnv.IsEmpty())
-			url->SetPassword(passwordEnv);
-
-		if (url->GetPort().IsEmpty())
-			url->SetPort("5665");
-
-		try {
-			l_TlsStream = ConsoleCommand::Connect(url->GetHost(), url->GetPort());
-		} catch (const std::exception& ex) {
-			return EXIT_FAILURE;
-		}
-	}
 
 	while (std::cin.good()) {
 		String fileName;
@@ -483,13 +483,7 @@ incomplete:
 			} else {
 				/* Remote debug console. */
 				try {
-					l_TlsStream = ConsoleCommand::Connect(url->GetHost(), url->GetPort());
-				} catch (const std::exception& ex) {
-					return EXIT_FAILURE;
-				}
-
-				try {
-					result = ExecuteScript(l_Session, l_TlsStream, url, command, scriptFrame.Sandboxed);
+					result = ExecuteScript(l_Session, l_TlsStream, command, scriptFrame.Sandboxed);
 				} catch (const ScriptError&) {
 					/* Re-throw the exception for the outside try-catch block. */
 					boost::rethrow_exception(boost::current_exception());
@@ -498,7 +492,7 @@ incomplete:
 						<< "HTTP query failed: " << ex.what();
 
 #ifdef HAVE_EDITLINE
-					/* Ensures that the terminal state is resetted */
+					/* Ensures that the terminal state is reset */
 					rl_deprep_terminal();
 #endif /* HAVE_EDITLINE */
 
@@ -644,9 +638,10 @@ Dictionary::Ptr ConsoleCommand::SendRequest(const std::shared_ptr<AsioTlsStream>
  * @param sandboxed Whether to run this sandboxed.
  * @return Result value, also contains user errors.
  */
-Value ConsoleCommand::ExecuteScript(const String& session, const std::shared_ptr<AsioTlsStream>& tlsStream,
-		const Url::Ptr& url, const String& command, bool sandboxed)
+Value ConsoleCommand::ExecuteScript(const String& session, const String& command, bool sandboxed)
 {
+	Url url = l_Url;
+
 	/* Extend the url parameters for the request. */
 	url->SetPath({"v1", "console", "execute-script"});
 
@@ -656,7 +651,15 @@ Value ConsoleCommand::ExecuteScript(const String& session, const std::shared_ptr
 		{"sandboxed", sandboxed ? "1" : "0"}
 	});
 
-	Dictionary::Ptr jsonResponse = SendRequest(tlsStream, url);
+	if (!l_TlsStream) {
+		try {
+			l_TlsStream = ConsoleCommand::Connect(url);
+		} catch (const std::exception& ex) {
+			return EXIT_FAILURE;
+		}
+	}
+
+	Dictionary::Ptr jsonResponse = SendRequest(l_TlsStream, url);
 
 	/* Extract the result, and handle user input errors too. */
 	Array::Ptr results = jsonResponse->Get("results");
@@ -689,30 +692,45 @@ Value ConsoleCommand::ExecuteScript(const String& session, const std::shared_ptr
 	return result;
 }
 
-void ConsoleCommand::AutocompleteScriptCompletionHandler(boost::mutex& mutex, boost::condition_variable& cv,
-	bool& ready, const boost::exception_ptr& eptr, const Array::Ptr& result, Array::Ptr& resultOut)
+/**
+ * Executes the auto completion script via HTTP and returns HTTP and user errors.
+ *
+ * @param session Local session handler.
+ * @param tlsStream AsioTlsStream pointer, must be constructed by the caller.
+ * @param url Url object, must be constructed by the caller.
+ * @param command The auto completion string.
+ * @param sandboxed Whether to run this sandboxed.
+ * @return Result value, also contains user errors.
+ */
+Array::Ptr ConsoleCommand::AutoCompleteScript(const String& session, const std::shared_ptr<AsioTlsStream>& tlsStream,
+	const Url::Ptr& url, const String& command, bool sandboxed)
 {
-	if (eptr) {
-		try {
-			boost::rethrow_exception(eptr);
-		} catch (const std::exception& ex) {
-			Log(LogCritical, "ConsoleCommand")
-				<< "HTTP query failed: " << ex.what();
+	/* Extend the url parameters for the request. */
+	url->SetPath({ "v1", "console", "auto-complete-script" });
 
-#ifdef HAVE_EDITLINE
-			/* Ensures that the terminal state is resetted */
-			rl_deprep_terminal();
-#endif /* HAVE_EDITLINE */
+	url->SetQuery({
+		{"session",   session},
+		{"command",   command},
+		{"sandboxed", sandboxed ? "1" : "0"}
+	});
 
-			Application::Exit(EXIT_FAILURE);
+	Dictionary::Ptr jsonResponse = SendRequest(tlsStream, url);
+
+	/* Extract the result, and handle user input errors too. */
+	Array::Ptr results = jsonResponse->Get("results");
+	Array::Ptr suggestions;
+
+	if (results && results->GetLength() > 0) {
+		Dictionary::Ptr resultInfo = results->Get(0);
+
+		if (resultInfo->Get("code") >= 200 && resultInfo->Get("code") <= 299) {
+			suggestions = resultInfo->Get("suggestions");
+		} else {
+			String errorMessage = resultInfo->Get("status");
+			BOOST_THROW_EXCEPTION(ScriptError(errorMessage));
 		}
 	}
 
-	resultOut = result;
-
-	{
-		boost::mutex::scoped_lock lock(mutex);
-		ready = true;
-		cv.notify_all();
-	}
+	return suggestions;
 }
+
